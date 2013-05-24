@@ -122,6 +122,7 @@ class RequestSendThread(val controllerId: Int,
 
     try{
       lock synchronized {
+        channel.connect() // establish a socket connection if needed
         channel.send(request)
         receive = channel.receive()
         var response: RequestOrResponse = null
@@ -130,6 +131,8 @@ class RequestSendThread(val controllerId: Int,
             response = LeaderAndIsrResponse.readFrom(receive.buffer)
           case RequestKeys.StopReplicaKey =>
             response = StopReplicaResponse.readFrom(receive.buffer)
+          case RequestKeys.UpdateMetadataKey =>
+            response = UpdateMetadataResponse.readFrom(receive.buffer)
         }
         stateChangeLogger.trace("Controller %d epoch %d received response correlationId %d for a request sent to broker %d"
                                   .format(controllerId, controllerContext.epoch, response.correlationId, toBrokerId))
@@ -140,8 +143,9 @@ class RequestSendThread(val controllerId: Int,
       }
     } catch {
       case e =>
-        // log it and let it go. Let controller shut it down.
-        debug("Exception occurs", e)
+        warn("Controller %d fails to send a request to broker %d".format(controllerId, toBrokerId), e)
+        // If there is any socket error (eg, socket timeout), the channel is no longer usable and needs to be recreated.
+        channel.disconnect()
     }
   }
 }
@@ -157,9 +161,18 @@ class ControllerBrokerRequestBatch(controllerContext: ControllerContext, sendReq
 
   def newBatch() {
     // raise error if the previous batch is not empty
-    if(leaderAndIsrRequestMap.size > 0 || stopReplicaRequestMap.size > 0)
+    if(leaderAndIsrRequestMap.size > 0)
       throw new IllegalStateException("Controller to broker state change requests batch is not empty while creating " +
-        "a new one. Some state changes %s might be lost ".format(leaderAndIsrRequestMap.toString()))
+        "a new one. Some LeaderAndIsr state changes %s might be lost ".format(leaderAndIsrRequestMap.toString()))
+    if(stopReplicaRequestMap.size > 0)
+      throw new IllegalStateException("Controller to broker state change requests batch is not empty while creating a " +
+        "new one. Some StopReplica state changes %s might be lost ".format(stopReplicaRequestMap.toString()))
+    if(updateMetadataRequestMap.size > 0)
+      throw new IllegalStateException("Controller to broker state change requests batch is not empty while creating a " +
+        "new one. Some UpdateMetadata state changes %s might be lost ".format(updateMetadataRequestMap.toString()))
+    if(stopAndDeleteReplicaRequestMap.size > 0)
+      throw new IllegalStateException("Controller to broker state change requests batch is not empty while creating a " +
+        "new one. Some StopReplica with delete state changes %s might be lost ".format(stopAndDeleteReplicaRequestMap.toString()))
     leaderAndIsrRequestMap.clear()
     stopReplicaRequestMap.clear()
     updateMetadataRequestMap.clear()

@@ -42,7 +42,7 @@ private[kafka] object Broker {
           throw new BrokerNotAvailableException("Broker id %d does not exist".format(id))
       }
     } catch {
-      case t => throw new KafkaException("Failed to parse the broker info from zookeeper: " + brokerInfoString, t)
+      case t: Throwable => throw new KafkaException("Failed to parse the broker info from zookeeper: " + brokerInfoString, t)
     }
   }
 
@@ -57,8 +57,6 @@ private[kafka] object Broker {
 private[kafka] case class Broker(val id: Int, val host: String, val port: Int) {
   
   override def toString(): String = new String("id:" + id + ",host:" + host + ",port:" + port)
-
-  def getZkString(): String = host + ":" + port
 
   def getConnectionString(): String = host + ":" + port
 

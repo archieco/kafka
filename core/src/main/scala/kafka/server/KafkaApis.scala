@@ -51,8 +51,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   * and is queried by the topic metadata request. */
   var leaderCache: mutable.Map[TopicAndPartition, PartitionStateInfo] =
     new mutable.HashMap[TopicAndPartition, PartitionStateInfo]()
-//  private var allBrokers: mutable.Map[Int, Broker] = new mutable.HashMap[Int, Broker]()
-  private var aliveBrokers: mutable.Map[Int, Broker] = new mutable.HashMap[Int, Broker]()
+  private val aliveBrokers: mutable.Map[Int, Broker] = new mutable.HashMap[Int, Broker]()
   private val partitionMetadataLock = new Object
   this.logIdent = "[KafkaApi-%d] ".format(brokerId)
 
@@ -170,9 +169,17 @@ class KafkaApis(val requestChannel: RequestChannel,
       !produceRequest.data.keySet.exists(
         m => replicaManager.getReplicationFactorForPartition(m.topic, m.partition) != 1)
     if(produceRequest.requiredAcks == 0) {
-      // send a fake producer response if producer request.required.acks = 0. This mimics the behavior of a 0.7 producer
-      // and is tuned for very high throughput
-      requestChannel.sendResponse(new RequestChannel.Response(request.processor, request, null))
+      // no operation needed if producer request.required.acks = 0; however, if there is any exception in handling the request, since
+      // no response is expected by the producer the handler will send a close connection response to the socket server
+      // to close the socket so that the producer client will know that some exception has happened and will refresh its metadata
+      if (numPartitionsInError != 0) {
+        info(("Send the close connection response due to error handling produce request " +
+          "[clientId = %s, correlationId = %s, topicAndPartition = %s] with Ack=0")
+          .format(produceRequest.clientId, produceRequest.correlationId, produceRequest.topicPartitionMessageSizeMap.keySet.mkString(",")))
+        requestChannel.closeConnection(request.processor, request)
+      } else {
+        requestChannel.noOperation(request.processor, request)
+      }
     } else if (produceRequest.requiredAcks == 1 ||
         produceRequest.numPartitions <= 0 ||
         allPartitionHaveReplicationFactorOne ||
@@ -257,7 +264,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           warn("Produce request with correlation id %d from client %s on partition %s failed due to %s".format(
                producerRequest.correlationId, producerRequest.clientId, topicAndPartition, nle.getMessage))
           new ProduceResult(topicAndPartition, nle)
-        case e =>
+        case e: Throwable =>
           BrokerTopicStats.getBrokerTopicStats(topicAndPartition.topic).failedProduceRequestRate.mark()
           BrokerTopicStats.getBrokerAllTopicsStats.failedProduceRequestRate.mark()
           error("Error processing ProducerRequest with correlation id %d from client %s on partition %s"
@@ -346,12 +353,11 @@ class KafkaApis(val requestChannel: RequestChannel,
               warn("Fetch request with correlation id %d from client %s on partition [%s,%d] failed due to %s".format(
                 fetchRequest.correlationId, fetchRequest.clientId, topic, partition, nle.getMessage))
               new FetchResponsePartitionData(ErrorMapping.codeFor(nle.getClass.asInstanceOf[Class[Throwable]]), -1L, MessageSet.Empty)
-            case t =>
+            case t: Throwable =>
               BrokerTopicStats.getBrokerTopicStats(topic).failedFetchRequestRate.mark()
               BrokerTopicStats.getBrokerAllTopicsStats.failedFetchRequestRate.mark()
               error("Error when processing fetch request for partition [%s,%d] offset %d from %s with correlation id %d"
-                    .format(topic, partition, offset, if (isFetchFromFollower) "follower" else "consumer", fetchRequest.correlationId),
-                    t)
+                    .format(topic, partition, offset, if (isFetchFromFollower) "follower" else "consumer", fetchRequest.correlationId), t)
               new FetchResponsePartitionData(ErrorMapping.codeFor(t.getClass.asInstanceOf[Class[Throwable]]), -1L, MessageSet.Empty)
           }
         (TopicAndPartition(topic, partition), partitionData)
@@ -424,7 +430,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           warn("Offset request with correlation id %d from client %s on partition %s failed due to %s".format(
                offsetRequest.correlationId, offsetRequest.clientId, topicAndPartition,nle.getMessage))
           (topicAndPartition, PartitionOffsetsResponse(ErrorMapping.codeFor(nle.getClass.asInstanceOf[Class[Throwable]]), Nil) )
-        case e =>
+        case e: Throwable =>
           warn("Error while responding to offset request", e)
           (topicAndPartition, PartitionOffsetsResponse(ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]), Nil) )
       }
@@ -475,7 +481,7 @@ class KafkaApis(val requestChannel: RequestChannel,
                     isr.filterNot(isrInfo.map(_.id).contains(_)).mkString(","))
                 new PartitionMetadata(topicAndPartition.partition, leaderInfo, replicaInfo, isrInfo, ErrorMapping.NoError)
               } catch {
-                case e =>
+                case e: Throwable =>
                   error("Error while fetching metadata for partition %s".format(topicAndPartition), e)
                   new PartitionMetadata(topicAndPartition.partition, leaderInfo, replicaInfo, isrInfo,
                     ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]]))

@@ -129,7 +129,7 @@ object MirrorMaker extends Logging {
     try {
       streams = connectors.map(_.createMessageStreamsByFilter(filterSpec, numStreams.intValue(), new DefaultDecoder(), new DefaultDecoder())).flatten
     } catch {
-      case t =>
+      case t: Throwable =>
         fatal("Unable to create stream - shutting down mirror maker.")
         connectors.foreach(_.shutdown)
     }
@@ -181,6 +181,7 @@ object MirrorMaker extends Logging {
 
     private val shutdownLatch = new CountDownLatch(1)
     private val threadName = "mirrormaker-" + threadId
+    this.logIdent = "[%s] ".format(threadName)
 
     this.setName(threadName)
 
@@ -203,11 +204,11 @@ object MirrorMaker extends Logging {
           }
         }
       } catch {
-        case e =>
-          fatal("%s stream unexpectedly exited.", e)
+        case e: Throwable =>
+          fatal("Stream unexpectedly exited.", e)
       } finally {
         shutdownLatch.countDown()
-        info("Stopped thread %s.".format(threadName))
+        info("Stopped thread.")
       }
     }
 

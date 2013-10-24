@@ -25,13 +25,13 @@ import kafka.cluster._
 import kafka.utils._
 import org.I0Itec.zkclient.exception.ZkNodeExistsException
 import java.net.InetAddress
-import org.I0Itec.zkclient.{IZkStateListener, IZkChildListener, ZkClient}
+import org.I0Itec.zkclient.{IZkDataListener, IZkStateListener, IZkChildListener, ZkClient}
 import org.apache.zookeeper.Watcher.Event.KeeperState
 import java.util.UUID
 import kafka.serializer._
 import kafka.utils.ZkUtils._
+import kafka.utils.Utils.inLock
 import kafka.common._
-import kafka.client.ClientUtils
 import com.yammer.metrics.core.Gauge
 import kafka.metrics._
 import scala.Some
@@ -91,6 +91,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
   private val messageStreamCreated = new AtomicBoolean(false)
 
   private var sessionExpirationListener: ZKSessionExpireListener = null
+  private var topicPartitionChangeListenner: ZKTopicPartitionChangeListener = null
   private var loadBalancerListener: ZKRebalancerListener = null
 
   private var wildcardTopicWatcher: ZookeeperTopicEventWatcher = null
@@ -153,32 +154,34 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
   }
 
   def shutdown() {
-    val canShutdown = isShuttingDown.compareAndSet(false, true);
-    if (canShutdown) {
-      info("ZKConsumerConnector shutting down")
+    rebalanceLock synchronized {
+      val canShutdown = isShuttingDown.compareAndSet(false, true);
+      if (canShutdown) {
+        info("ZKConsumerConnector shutting down")
 
-      if (wildcardTopicWatcher != null)
-        wildcardTopicWatcher.shutdown()
-      try {
-        if (config.autoCommitEnable)
-          scheduler.shutdownNow()
-        fetcher match {
-          case Some(f) => f.stopConnections
-          case None =>
+        if (wildcardTopicWatcher != null)
+          wildcardTopicWatcher.shutdown()
+        try {
+          if (config.autoCommitEnable)
+	        scheduler.shutdownNow()
+          fetcher match {
+            case Some(f) => f.stopConnections
+            case None =>
+          }
+          sendShutdownToAllQueues()
+          if (config.autoCommitEnable)
+            commitOffsets()
+          if (zkClient != null) {
+            zkClient.close()
+            zkClient = null
+          }
+        } catch {
+          case e: Throwable =>
+            fatal("error during consumer connector shutdown", e)
         }
-        sendShutdownToAllQueues()
-        if (config.autoCommitEnable)
-          commitOffsets()
-        if (zkClient != null) {
-          zkClient.close()
-          zkClient = null
-        }
-      } catch {
-        case e =>
-          fatal("error during consumer connector shutdown", e)
+        info("ZKConsumerConnector shut down completed")
       }
-      info("ZKConsumerConnector shut down completed")
-    }
+	}
   }
 
   def consume[K, V](topicCountMap: scala.collection.Map[String,Int], keyDecoder: Decoder[K], valueDecoder: Decoder[V])
@@ -211,12 +214,14 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
   // this API is used by unit tests only
   def getTopicRegistry: Pool[String, Pool[Int, PartitionTopicInfo]] = topicRegistry
 
-  private def registerConsumerInZK(dirs: ZKGroupDirs, consumerIdString: String, topicCount: TopicCount) = {
+  private def registerConsumerInZK(dirs: ZKGroupDirs, consumerIdString: String, topicCount: TopicCount) {
     info("begin registering consumer " + consumerIdString + " in ZK")
+    val timestamp = SystemTime.milliseconds.toString
     val consumerRegistrationInfo =
       Utils.mergeJsonFields(Utils.mapToJsonFields(Map("version" -> 1.toString, "subscription" -> topicCount.dbString), valueInQuotes = false)
-                             ++ Utils.mapToJsonFields(Map("pattern" -> topicCount.pattern), valueInQuotes = true))
-    createEphemeralPathExpectConflict(zkClient, dirs.consumerRegistryDir + "/" + consumerIdString, consumerRegistrationInfo)
+                             ++ Utils.mapToJsonFields(Map("pattern" -> topicCount.pattern, "timestamp" -> timestamp), valueInQuotes = true))
+
+    createEphemeralPathExpectConflictHandleZKBug(zkClient, dirs.consumerRegistryDir + "/" + consumerIdString, consumerRegistrationInfo, null, (consumerZKString, consumer) => true, config.zkSessionTimeoutMs)
     info("end registering consumer " + consumerIdString + " in ZK")
   }
 
@@ -265,8 +270,6 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
     }
   }
 
-
-
   class ZKSessionExpireListener(val dirs: ZKGroupDirs,
                                  val consumerIdString: String,
                                  val topicCount: TopicCount,
@@ -303,6 +306,29 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
 
   }
 
+  class ZKTopicPartitionChangeListener(val loadBalancerListener: ZKRebalancerListener)
+    extends IZkDataListener {
+
+    def handleDataChange(dataPath : String, data: Object) {
+      try {
+        info("Topic info for path " + dataPath + " changed to " + data.toString + ", triggering rebalance")
+        // explicitly trigger load balancing for this consumer
+        loadBalancerListener.syncedRebalance()
+
+        // There is no need to re-subscribe the watcher since it will be automatically
+        // re-registered upon firing of this event by zkClient
+      } catch {
+        case e: Throwable => error("Error while handling topic partition change for data path " + dataPath, e )
+      }
+    }
+
+    @throws(classOf[Exception])
+    def handleDataDeleted(dataPath : String) {
+      // TODO: This need to be implemented when we support delete topic
+      warn("Topic for path " + dataPath + " gets deleted, which should not happen at this time")
+    }
+  }
+
   class ZKRebalancerListener(val group: String, val consumerIdString: String,
                              val kafkaMessageAndMetadataStreams: mutable.Map[String,List[KafkaStream[_,_]]])
     extends IZkChildListener {
@@ -328,7 +354,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
             if (doRebalance)
               syncedRebalance
           } catch {
-            case t => error("error during syncedRebalance", t)
+            case t: Throwable => error("error during syncedRebalance", t)
           }
         }
         info("stopping watcher executor thread for consumer " + consumerIdString)
@@ -338,12 +364,9 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
 
     @throws(classOf[Exception])
     def handleChildChange(parentPath : String, curChilds : java.util.List[String]) {
-      lock.lock()
-      try {
+      inLock(lock) {
         isWatcherTriggered = true
         cond.signalAll()
-      } finally {
-        lock.unlock()
       }
     }
 
@@ -369,31 +392,36 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
 
     def syncedRebalance() {
       rebalanceLock synchronized {
-        for (i <- 0 until config.rebalanceMaxRetries) {
-          info("begin rebalancing consumer " + consumerIdString + " try #" + i)
-          var done = false
-          val cluster = getCluster(zkClient)
-          try {
-            done = rebalance(cluster)
-          } catch {
-            case e =>
-              /** occasionally, we may hit a ZK exception because the ZK state is changing while we are iterating.
-               * For example, a ZK node can disappear between the time we get all children and the time we try to get
-               * the value of a child. Just let this go since another rebalance will be triggered.
-               **/
-              info("exception during rebalance ", e)
-          }
-          info("end rebalancing consumer " + consumerIdString + " try #" + i)
-          if (done) {
-            return
-          } else {
+        if(isShuttingDown.get())  {
+          return
+        } else {
+          for (i <- 0 until config.rebalanceMaxRetries) {
+            info("begin rebalancing consumer " + consumerIdString + " try #" + i)
+            var done = false
+            var cluster: Cluster = null
+            try {
+              cluster = getCluster(zkClient)
+              done = rebalance(cluster)
+            } catch {
+              case e: Throwable =>
+                /** occasionally, we may hit a ZK exception because the ZK state is changing while we are iterating.
+                 * For example, a ZK node can disappear between the time we get all children and the time we try to get
+                 * the value of a child. Just let this go since another rebalance will be triggered.
+                 **/
+                info("exception during rebalance ", e)
+            }
+            info("end rebalancing consumer " + consumerIdString + " try #" + i)
+            if (done) {
+              return
+            } else {
               /* Here the cache is at a risk of being stale. To take future rebalancing decisions correctly, we should
                * clear the cache */
               info("Rebalancing attempt failed. Clearing the cache before the next rebalancing operation is triggered")
+            }
+            // stop all fetchers and clear all the queues to avoid data duplication
+            closeFetchersForQueues(cluster, kafkaMessageAndMetadataStreams, topicThreadIdAndQueues.map(q => q._2))
+            Thread.sleep(config.rebalanceBackoffMs)
           }
-          // stop all fetchers and clear all the queues to avoid data duplication
-          closeFetchersForQueues(cluster, kafkaMessageAndMetadataStreams, topicThreadIdAndQueues.map(q => q._2))
-          Thread.sleep(config.rebalanceBackoffMs)
         }
       }
 
@@ -413,17 +441,8 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
         true
       }
       else {
-        val topicsMetadata = ClientUtils.fetchTopicMetadata(myTopicThreadIdsMap.keySet,
-                                                            brokers,
-                                                            config.clientId,
-                                                            config.socketTimeoutMs,
-                                                            correlationId.getAndIncrement).topicsMetadata
-        val partitionsPerTopicMap = new mutable.HashMap[String, Seq[Int]]
-        topicsMetadata.foreach(m => {
-          val topic = m.topic
-          val partitions = m.partitionsMetadata.map(m1 => m1.partitionId)
-          partitionsPerTopicMap.put(topic, partitions)
-        })
+        val partitionsAssignmentPerTopicMap = getPartitionAssignmentForTopics(zkClient, myTopicThreadIdsMap.keySet.toSeq)
+        val partitionsPerTopicMap = partitionsAssignmentPerTopicMap.map(p => (p._1, p._2.keySet.toSeq.sorted))
 
         /**
          * fetchers must be stopped to avoid data duplication, since if the current
@@ -452,7 +471,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
             " for topic " + topic + " with consumers: " + curConsumers)
 
           for (consumerThreadId <- consumerThreadIdSet) {
-            val myConsumerPosition = curConsumers.findIndexOf(_ == consumerThreadId)
+            val myConsumerPosition = curConsumers.indexOf(consumerThreadId)
             assert(myConsumerPosition >= 0)
             val startPart = nPartsPerConsumer*myConsumerPosition + myConsumerPosition.min(nConsumersWithExtraPart)
             val nParts = nPartsPerConsumer + (if (myConsumerPosition + 1 > nConsumersWithExtraPart) 0 else 1)
@@ -572,7 +591,7 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
             // The node hasn't been deleted by the original owner. So wait a bit and retry.
             info("waiting for the partition ownership to be deleted: " + partition)
             false
-          case e2 => throw e2
+          case e2: Throwable => throw e2
         }
       }
       val hasPartitionOwnershipFailed = partitionOwnershipSuccessful.foldLeft(0)((sum, decision) => sum + (if(decision) 0 else 1))
@@ -627,10 +646,14 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
         config.groupId, consumerIdString, topicStreamsMap.asInstanceOf[scala.collection.mutable.Map[String, List[KafkaStream[_,_]]]])
     }
 
-    // register listener for session expired event
+    // create listener for session expired event if not exist yet
     if (sessionExpirationListener == null)
       sessionExpirationListener = new ZKSessionExpireListener(
         dirs, consumerIdString, topicCount, loadBalancerListener)
+
+    // create listener for topic partition change event if not exist yet
+    if (topicPartitionChangeListenner == null)
+      topicPartitionChangeListenner = new ZKTopicPartitionChangeListener(loadBalancerListener)
 
     val topicStreamsMap = loadBalancerListener.kafkaMessageAndMetadataStreams
 
@@ -687,8 +710,8 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
 
     topicStreamsMap.foreach { topicAndStreams =>
       // register on broker partition path changes
-      val partitionPath = BrokerTopicsPath + "/" + topicAndStreams._1
-      zkClient.subscribeChildChanges(partitionPath, loadBalancerListener)
+      val topicPath = BrokerTopicsPath + "/" + topicAndStreams._1
+      zkClient.subscribeDataChanges(topicPath, topicPartitionChangeListenner)
     }
 
     // explicitly trigger load balancing for this consumer
